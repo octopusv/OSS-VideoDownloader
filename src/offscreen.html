@@ -1,0 +1,11 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>Vidulus offscreen worker</title>
+  <!-- ffmpeg.wasm core を classic script で先に読み込み globalThis.createFFmpegCore を確立 -->
+  <script src="vendor/ffmpeg/ffmpeg-core.js"></script>
+  <script src="offscreen.js" type="module"></script>
+</head>
+<body><!-- 非表示の処理用ドキュメント --></body>
+</html>

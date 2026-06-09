@@ -10,6 +10,20 @@ const tabHls = new Map();
 
 const MAX_ITEMS_PER_TAB = 200;
 
+// 進行中の HLS ダウンロードの「真実の状態」。popup を閉じても進捗を保持し、
+// 再オープン時・別ページ移動後でも復元できるようにする。 dlId -> 進捗レコード
+// { dlId, tabId, itemId, filename, kind, status:'active', phase:'download'|'convert', done, total, bytes, frac }
+const downloads = new Map();
+
+function getActiveDownloads(tabId) {
+  return [...downloads.values()].filter((d) => d.tabId === tabId && d.status === 'active');
+}
+
+// ダウンロード完了/失敗を全コンテキスト（再オープンされた popup を含む）へ通知
+function broadcastDownloadDone(dlId, tabId, ok, error) {
+  chrome.runtime.sendMessage({ type: 'download-complete', dlId, tabId, ok, error }).catch(() => {});
+}
+
 function getTabMap(tabId) {
   if (!tabsMedia.has(tabId)) tabsMedia.set(tabId, new Map());
   return tabsMedia.get(tabId);
@@ -176,8 +190,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case 'get-media': {
       const map = tabsMedia.get(msg.tabId);
       const items = map ? [...map.values()].sort((a, b) => b.addedAt - a.addedAt) : [];
-      sendResponse({ items });
+      // 進行中ダウンロードも一緒に返し、popup 再オープン時に進捗を復元できるようにする
+      sendResponse({ items, downloads: getActiveDownloads(msg.tabId) });
       return true;
+    }
+
+    case 'download-progress': {
+      // offscreen からの進捗を「真実の状態」へ反映（popup へは別途直接届く）
+      const d = downloads.get(msg.dlId);
+      if (d) {
+        if (msg.phase === 'convert') {
+          d.phase = 'convert';
+          d.frac = msg.frac;
+        } else {
+          d.phase = 'download';
+          d.done = msg.done;
+          d.total = msg.total;
+          d.bytes = msg.bytes;
+        }
+      }
+      break;
     }
 
     case 'probe-hls': {
@@ -216,6 +248,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case 'remove-item': {
       const map = tabsMedia.get(msg.tabId);
       if (map) { map.delete(msg.id); badge(msg.tabId); notifyPopup(msg.tabId); }
+      sendResponse?.({ ok: true });
+      break;
+    }
+
+    case 'set-name': {
+      // ユーザーが編集した保存名を item に保持（popup を閉じても残す）。
+      // 実ファイル名のサニタイズは保存時 handleDownload で行う。
+      const item = tabsMedia.get(msg.tabId)?.get(msg.id);
+      if (item) {
+        const name = (msg.name || '').trim();
+        if (name) item.customName = name;
+        else delete item.customName;
+      }
       sendResponse?.({ ok: true });
       break;
     }
@@ -277,6 +322,13 @@ async function handleDownload(msg, tabId) {
     const dlId = msg.dlId || (crypto.randomUUID ? crypto.randomUUID() : hashId(item.url + Date.now()));
     const format = msg.format || await getFormatSetting();
     pendingJobs.add(dlId);
+    // 進捗レコードを登録（早期に登録し、取得開始直後の再オープンでも復元可能にする）
+    // filename/kind も保持し、別ページへ移動して元アイテムが消えても単独カードで表示できるようにする
+    downloads.set(dlId, {
+      dlId, tabId, itemId: item.id, status: 'active',
+      filename: filename || item.filename || 'video', kind: item.kind,
+      phase: 'download', done: 0, total: 1, bytes: 0, frac: 0,
+    });
     let revoked = false;
     const revoke = () => {
       if (revoked) return;
@@ -306,11 +358,17 @@ async function handleDownload(msg, tabId) {
         pendingJobs.delete(dlId);
         maybeCloseOffscreen();
       });
+      // セグメント取得・変換は完了し、あとはブラウザがディスクへ書き出すだけ。
+      // 進捗を完了扱いにして、再オープンされた popup にも通知する。
+      downloads.delete(dlId);
+      broadcastDownloadDone(dlId, tabId, true);
       return { ok: true, downloadId, mode: 'hls-' + result.ext };
     } catch (e) {
       revoke();
       pendingJobs.delete(dlId);
       maybeCloseOffscreen();
+      downloads.delete(dlId);
+      broadcastDownloadDone(dlId, tabId, false, String(e?.message || e));
       throw e;
     }
   }
@@ -399,6 +457,7 @@ function waitDownloadDone(id) {
 chrome.tabs.onRemoved.addListener((tabId) => {
   tabsMedia.delete(tabId);
   tabHls.delete(tabId);
+  for (const [dlId, d] of downloads) if (d.tabId === tabId) downloads.delete(dlId);
 });
 
 chrome.tabs.onUpdated.addListener((tabId, info) => {

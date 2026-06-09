@@ -10,6 +10,7 @@ const els = {
   filterBar: document.getElementById('filterBar'),
   tpl: document.getElementById('itemTpl'),
   formatSelect: document.getElementById('formatSelect'),
+  confirmName: document.getElementById('confirmName'),
 };
 const FORMAT_LABEL = { mp4: 'MP4', mkv: 'MKV', m4a: 'M4A', mp3: 'MP3', ts: 'TS' };
 
@@ -17,6 +18,8 @@ let TAB_ID = null;
 let items = [];
 let filter = 'all';
 let activeDownloads = 0;   // 進行中の DL 件数（>0 の間は再描画を抑制）
+let serverDownloads = [];  // background が保持する進行中 DL（再オープン時の復元用）
+let confirmName = false;   // 保存前に名前を確認するか（フッターのトグル）
 
 const KIND_LABEL = { video: 'VIDEO', audio: 'AUDIO', hls: 'HLS', dash: 'DASH', segment: 'SEG' };
 
@@ -31,6 +34,7 @@ async function init() {
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg.type === 'media-updated' && msg.tabId === TAB_ID) refresh();
     if (msg.type === 'download-progress') onProgress(msg);
+    if (msg.type === 'download-complete' && msg.tabId === TAB_ID) onDownloadComplete(msg);
   });
 }
 
@@ -67,11 +71,22 @@ function bindUI() {
     chrome.storage.local.set({ outFormat: fmt });
     toast(`保存形式: ${FORMAT_LABEL[fmt] || fmt}`);
   });
+
+  // 「保存前に名前を確認」トグル
+  chrome.storage.local.get('confirmName').then(({ confirmName: cn = false }) => {
+    confirmName = !!cn;
+    els.confirmName.checked = confirmName;
+  });
+  els.confirmName.addEventListener('change', () => {
+    confirmName = els.confirmName.checked;
+    chrome.storage.local.set({ confirmName });
+  });
 }
 
 async function refresh() {
   const res = await chrome.runtime.sendMessage({ type: 'get-media', tabId: TAB_ID });
   items = res?.items || [];
+  serverDownloads = res?.downloads || [];
   if (activeDownloads > 0) return;   // DL 中はリスト再構築を避ける
   render();
 }
@@ -87,7 +102,8 @@ function render() {
     : '検出待機中';
 
   els.list.innerHTML = '';
-  if (!vis.length) {
+  // 検出メディアが無くても、進行中 DL があれば一覧を表示する（別ページ移動時など）
+  if (!vis.length && !serverDownloads.length) {
     els.empty.hidden = false;
     els.list.style.display = 'none';
     return;
@@ -96,16 +112,67 @@ function render() {
   els.list.style.display = 'flex';
 
   for (const item of vis) els.list.appendChild(renderCard(item));
+  restoreDownloads();   // 進行中 DL のプログレスバー・キャンセル状態を復元
+}
+
+// background が保持する進行中 DL を DOM に反映（popup 再オープン・別ページ移動後）。
+// 元アイテムのカードがあればそれに復元し、無ければ DL 専用カードを生成して表示する。
+function restoreDownloads() {
+  for (const d of serverDownloads) {
+    let node = [...els.list.children].find((n) => n.__itemId === d.itemId);
+    if (node && node.__downloading) continue;   // この popup が起票した進行中はそのまま
+    if (!node) {
+      node = renderDownloadCard(d);             // 検出リストに元アイテムが無い
+      els.list.appendChild(node);
+    }
+    applyDownloadState(node, d);
+  }
+}
+
+// ノードを「進行中」状態にし、現在の進捗を反映
+function applyDownloadState(node, d) {
+  node.__downloading = true;
+  node.__dlId = d.dlId;            // 後続の進捗イベントと紐付け
+  const dlBtn = node.querySelector('.dl-btn');
+  dlBtn.classList.remove('done');
+  dlBtn.classList.add('cancel');
+  dlBtn.title = 'キャンセル';
+  dlBtn.innerHTML = ICON_CANCEL;
+  if (d.phase === 'convert') showConverting(node, d.frac);
+  else updateProgressUI(node, d.done || 0, d.total || 1, d.bytes || 0);
+}
+
+// 元アイテムを伴わない進行中 DL 用の簡易カード（タイトル・種別・進捗・キャンセルのみ）
+function renderDownloadCard(d) {
+  const node = els.tpl.content.firstElementChild.cloneNode(true);
+  node.__itemId = d.itemId;
+  const badge = node.querySelector('.kind-badge');
+  const title = node.querySelector('.title');
+  const moreBtn = node.querySelector('.more-btn');
+  const dlBtn = node.querySelector('.dl-btn');
+
+  const kind = d.kind || 'hls';
+  badge.textContent = KIND_LABEL[kind] || kind.toUpperCase();
+  badge.className = `kind-badge kind-${kind}`;
+  title.textContent = clean(d.filename) || 'ダウンロード中';
+  title.title = title.textContent;
+  moreBtn.hidden = true;          // 元アイテムが無いため補助メニューは出さない
+  node.querySelector('.rename-btn').hidden = true;   // リネーム対象アイテムが無い
+
+  dlBtn.addEventListener('click', () => cancelDownload(node));
+  return node;
 }
 
 function renderCard(item) {
   const node = els.tpl.content.firstElementChild.cloneNode(true);
+  node.__itemId = item.id;   // 進行中 DL の復元時に item と DOM を照合するため
   const thumb = node.querySelector('.thumb');
   const badge = node.querySelector('.kind-badge');
   const title = node.querySelector('.title');
   const subline = node.querySelector('.subline');
   const dlBtn = node.querySelector('.dl-btn');
   const moreBtn = node.querySelector('.more-btn');
+  const renameBtn = node.querySelector('.rename-btn');
 
   badge.textContent = KIND_LABEL[item.kind] || item.kind.toUpperCase();
   badge.className = `kind-badge kind-${item.kind}`;
@@ -145,11 +212,74 @@ function renderCard(item) {
 
   dlBtn.addEventListener('click', () => {
     if (node.__downloading) cancelDownload(node);
-    else startDownload(item, node, dlBtn);
+    else requestDownload(item, node, dlBtn);
   });
   moreBtn.addEventListener('click', (e) => openMore(e, item, node));
+  renameBtn.addEventListener('click', (e) => { e.stopPropagation(); beginEdit(node, item); });
 
   return node;
+}
+
+// ダウンロード起点。「保存前に名前を確認」が ON なら、まずタイトル編集に入り
+// Enter で確定してから保存する。OFF ならそのまま保存。
+function requestDownload(item, node, dlBtn, variant) {
+  if (node.__downloading) return;
+  if (confirmName) {
+    toast('名前を編集して Enter で保存');
+    beginEdit(node, item, () => startDownload(item, node, dlBtn, variant));
+  } else {
+    startDownload(item, node, dlBtn, variant);
+  }
+}
+
+// タイトルのインライン編集。onConfirm を渡すと「確定して保存」モード
+// （Enter=確定して onConfirm、Esc/フォーカスアウト=取消）。
+// 省略時は自由リネーム（Enter/フォーカスアウト=保存、Esc=取消）。
+function beginEdit(node, item, onConfirm) {
+  const titleEl = node.querySelector('.title');
+  if (titleEl.isContentEditable) return;
+  const forDownload = typeof onConfirm === 'function';
+  const original = niceName(item);
+
+  titleEl.textContent = original;
+  titleEl.contentEditable = 'plaintext-only';
+  titleEl.classList.add('editing');
+  titleEl.focus();
+  const range = document.createRange();
+  range.selectNodeContents(titleEl);
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+
+  let done = false;
+  const finish = (save, proceed) => {
+    if (done) return;
+    done = true;
+    titleEl.removeEventListener('keydown', onKey);
+    titleEl.removeEventListener('blur', onBlur);
+    titleEl.contentEditable = 'false';
+    titleEl.classList.remove('editing');
+    let name = original;
+    if (save) {
+      // ユーザー入力はそのまま尊重（_や+を変換しない）。FS 用サニタイズは保存時に行う。
+      name = (titleEl.textContent || '').trim().slice(0, 120) || original;
+      if (name !== (item.customName || '')) {
+        item.customName = name;
+        chrome.runtime.sendMessage({ type: 'set-name', tabId: TAB_ID, id: item.id, name }).catch(() => {});
+      }
+    }
+    titleEl.textContent = name;
+    titleEl.title = item.url;
+    if (proceed) onConfirm();
+  };
+  const onKey = (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); finish(true, forDownload); }
+    else if (e.key === 'Escape') { e.preventDefault(); finish(false, false); }
+  };
+  // 保存フローでは誤操作防止のためフォーカスアウトは取消、自由リネームでは確定
+  const onBlur = () => finish(!forDownload, false);
+  titleEl.addEventListener('keydown', onKey);
+  titleEl.addEventListener('blur', onBlur);
 }
 
 async function startDownload(item, node, dlBtn, variant) {
@@ -232,7 +362,7 @@ async function openMore(e, item, node) {
           ev.stopPropagation();
           closeMenus();
           const dlBtn = node.querySelector('.dl-btn');
-          startDownload(item, node, dlBtn, v); // variant オブジェクトを渡す（audioUrl 含む）
+          requestDownload(item, node, dlBtn, v); // variant オブジェクトを渡す（audioUrl 含む）
         });
         menu.appendChild(b);
       }
@@ -263,7 +393,7 @@ async function openMore(e, item, node) {
       } else {
         addMenuItem(menu, '単一品質をダウンロード', () => {
           closeMenus();
-          startDownload(item, node, node.querySelector('.dl-btn'));
+          requestDownload(item, node, node.querySelector('.dl-btn'));
         });
         addMenuItem(menu, 'URL をコピー', () => copyUrl(item.url));
       }
@@ -328,6 +458,24 @@ function onProgress(msg) {
     showConverting(node, msg.frac);
   } else {
     updateProgressUI(node, msg.done, msg.total, msg.bytes);
+  }
+}
+// background からの完了/失敗通知。startDownload を発行していない（再オープンされた）
+// popup でも UI を確定させる。発行元 popup では await 側と二重になるが冪等。
+function onDownloadComplete(msg) {
+  const node = [...els.list.children].find((n) => n.__dlId === msg.dlId);
+  if (!node) return;
+  const dlBtn = node.querySelector('.dl-btn');
+  if (msg.ok) {
+    markDone(dlBtn, node);
+  } else {
+    node.__downloading = false;
+    dlBtn.classList.remove('cancel');
+    dlBtn.title = 'ダウンロード';
+    dlBtn.innerHTML = ICON_DL;
+    hideProgress(node);
+    const aborted = /abort/i.test(String(msg.error || ''));
+    if (!aborted) toast('ダウンロード失敗: ' + (msg.error || ''), true);
   }
 }
 function showConverting(node, frac) {
@@ -406,6 +554,7 @@ function requestThumb(item, thumb, badge) {
 
 // ---- helpers ----
 function niceName(item) {
+  if (item.customName) return item.customName.trim().slice(0, 120) || 'media';   // ユーザー編集名を最優先
   if (item.title && item.kind === 'hls') return clean(item.title);
   let base = item.filename || '';
   base = base.replace(/\.[a-z0-9]{1,5}$/i, '');

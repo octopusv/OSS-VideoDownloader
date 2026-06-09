@@ -70,6 +70,10 @@
         <option value="ts">TS · 変換なし</option>
       </select>
     </label>
+    <label class="opt-row" title="ON にすると、ダウンロード時にまず名前を編集してから保存します">
+      <input type="checkbox" id="confirmName" />
+      <span>保存前に名前を確認</span>
+    </label>
   </footer>
 
   <!-- アイテムのテンプレート -->
@@ -79,7 +83,16 @@
         <span class="kind-badge"></span>
       </div>
       <div class="meta">
-        <div class="title"></div>
+        <div class="title-row">
+          <div class="title"></div>
+          <button class="rename-btn" title="名前を編集" tabindex="-1">
+            <svg viewBox="0 0 24 24" width="13" height="13" fill="none">
+              <path d="M4 20h4L18.5 9.5a2.12 2.12 0 0 0-3-3L5 17v3Z" stroke="currentColor"
+                    stroke-width="1.8" stroke-linejoin="round"/>
+              <path d="M13.5 6.5l4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+            </svg>
+          </button>
+        </div>
         <div class="subline"></div>
         <div class="progress" hidden>
           <div class="bar"><span></span></div>

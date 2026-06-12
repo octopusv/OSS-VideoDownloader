@@ -11,6 +11,12 @@ const els = {
   tpl: document.getElementById('itemTpl'),
   formatSelect: document.getElementById('formatSelect'),
   confirmName: document.getElementById('confirmName'),
+  seqToggle: document.getElementById('seqToggle'),
+  seqPanel: document.getElementById('seqPanel'),
+  seqMajor: document.getElementById('seqMajor'),
+  seqMinor: document.getElementById('seqMinor'),
+  seqNextChapter: document.getElementById('seqNextChapter'),
+  seqReset: document.getElementById('seqReset'),
 };
 const FORMAT_LABEL = { mp4: 'MP4', mkv: 'MKV', m4a: 'M4A', mp3: 'MP3', ts: 'TS' };
 
@@ -20,6 +26,7 @@ let filter = 'all';
 let activeDownloads = 0;   // 進行中の DL 件数（>0 の間は再描画を抑制）
 let serverDownloads = [];  // background が保持する進行中 DL（再オープン時の復元用）
 let confirmName = false;   // 保存前に名前を確認するか（フッターのトグル）
+let seq = { enabled: false, major: 1, minor: 1 };  // 連番モード（章_パートの自動命名）
 
 const KIND_LABEL = { video: 'VIDEO', audio: 'AUDIO', hls: 'HLS', dash: 'DASH', segment: 'SEG' };
 
@@ -80,6 +87,36 @@ function bindUI() {
   els.confirmName.addEventListener('change', () => {
     confirmName = els.confirmName.checked;
     chrome.storage.local.set({ confirmName });
+  });
+
+  // 連番モード（章_パートの自動命名）。状態は storage に保持し、再オープン・別ページでも継続。
+  chrome.storage.local.get('seq').then(({ seq: s }) => {
+    if (s && typeof s === 'object') {
+      seq = { enabled: !!s.enabled, major: clampSeq(s.major), minor: clampSeq(s.minor) };
+    }
+    renderSeq();
+  });
+  els.seqToggle.addEventListener('change', () => {
+    seq.enabled = els.seqToggle.checked;
+    saveSeq();
+    renderSeq();
+    toast(seq.enabled ? `連番で保存: 次は ${seqName()}` : '連番モードを解除しました');
+  });
+  els.seqMajor.addEventListener('change', readSeqInputs);
+  els.seqMinor.addEventListener('change', readSeqInputs);
+  els.seqNextChapter.addEventListener('click', () => {
+    seq.major = clampSeq(seq.major) + 1;   // 章を進めてパートを 1 に戻す（例: 1_3 → 2_1）
+    seq.minor = 1;
+    saveSeq();
+    renderSeq();
+    toast(`次の章へ: ${seqName()}`);
+  });
+  els.seqReset.addEventListener('click', () => {
+    seq.major = 1;
+    seq.minor = 1;
+    saveSeq();
+    renderSeq();
+    toast(`連番をリセット: ${seqName()}`);
   });
 }
 
@@ -224,22 +261,25 @@ function renderCard(item) {
 // Enter で確定してから保存する。OFF ならそのまま保存。
 function requestDownload(item, node, dlBtn, variant) {
   if (node.__downloading) return;
+  // 連番モード時は「章_パート」を保存名の既定にする（番号のみ）
+  const preset = seq.enabled ? seqName() : null;
   if (confirmName) {
-    toast('名前を編集して Enter で保存');
-    beginEdit(node, item, () => startDownload(item, node, dlBtn, variant));
+    toast(preset ? `連番名「${preset}」を確認して Enter で保存` : '名前を編集して Enter で保存');
+    beginEdit(node, item, (finalName) => startDownload(item, node, dlBtn, variant, finalName), preset);
   } else {
-    startDownload(item, node, dlBtn, variant);
+    startDownload(item, node, dlBtn, variant, preset);
   }
 }
 
 // タイトルのインライン編集。onConfirm を渡すと「確定して保存」モード
 // （Enter=確定して onConfirm、Esc/フォーカスアウト=取消）。
 // 省略時は自由リネーム（Enter/フォーカスアウト=保存、Esc=取消）。
-function beginEdit(node, item, onConfirm) {
+function beginEdit(node, item, onConfirm, preset) {
   const titleEl = node.querySelector('.title');
   if (titleEl.isContentEditable) return;
   const forDownload = typeof onConfirm === 'function';
-  const original = niceName(item);
+  // preset は連番モードの保存名（この DL 限り）。指定時はそれを初期値にする。
+  const original = preset != null ? preset : niceName(item);
 
   titleEl.textContent = original;
   titleEl.contentEditable = 'plaintext-only';
@@ -263,14 +303,16 @@ function beginEdit(node, item, onConfirm) {
     if (save) {
       // ユーザー入力はそのまま尊重（_や+を変換しない）。FS 用サニタイズは保存時に行う。
       name = (titleEl.textContent || '').trim().slice(0, 120) || original;
-      if (name !== (item.customName || '')) {
+      // 連番モード（preset 指定）の名前はこの DL 限り。customName には保存しない。
+      if (preset == null && name !== (item.customName || '')) {
         item.customName = name;
         chrome.runtime.sendMessage({ type: 'set-name', tabId: TAB_ID, id: item.id, name }).catch(() => {});
       }
     }
-    titleEl.textContent = name;
+    // 連番モードはファイル名のみ番号にし、カードの表示は元のタイトルへ戻す
+    titleEl.textContent = preset != null ? niceName(item) : name;
     titleEl.title = item.url;
-    if (proceed) onConfirm();
+    if (proceed) onConfirm(name);
   };
   const onKey = (e) => {
     if (e.key === 'Enter') { e.preventDefault(); finish(true, forDownload); }
@@ -282,9 +324,18 @@ function beginEdit(node, item, onConfirm) {
   titleEl.addEventListener('blur', onBlur);
 }
 
-async function startDownload(item, node, dlBtn, variant) {
+async function startDownload(item, node, dlBtn, variant, name) {
   if (node.__downloading) return;   // 二重起動ガード
   node.__downloading = true;
+  const filename = name || niceName(item);   // 連番モード時は呼び出し側が「章_パート」を渡す
+
+  // 連番モード: この DL で現在の番号を消費し、楽観的に次のパートへ進める（失敗時は巻き戻す）
+  let seqUsed = null;
+  if (seq.enabled) {
+    seqUsed = { major: seq.major, minor: seq.minor };
+    advanceSeq();
+  }
+
   const dlId = (crypto.randomUUID ? crypto.randomUUID() : item.id + '_' + Date.now());
   node.__dlId = dlId;          // 進捗イベントとノードを紐付け
   activeDownloads++;
@@ -304,7 +355,7 @@ async function startDownload(item, node, dlBtn, variant) {
       type: 'download',
       tabId: TAB_ID,
       item,
-      filename: niceName(item),
+      filename,
       dlId,
       variantUrl: chosen?.url,
       audioUrl: chosen?.audioUrl || null,
@@ -322,6 +373,7 @@ async function startDownload(item, node, dlBtn, variant) {
     dlBtn.title = 'ダウンロード';
     dlBtn.innerHTML = ICON_DL;
     hideProgress(node);
+    if (seqUsed) rollbackSeq(seqUsed);   // 失敗・中断時は消費した番号を戻す
     const aborted = /abort/i.test(String(e?.message || e));
     toast(aborted ? 'ダウンロードをキャンセルしました' : 'ダウンロード失敗: ' + (e.message || e), !aborted);
   } finally {
@@ -550,6 +602,41 @@ function requestThumb(item, thumb, badge) {
     })
     .catch(() => thumb.classList.remove('loading'))
     .finally(() => thumbRequested.delete(item.id));
+}
+
+// ---- 連番モード（章_パートの自動命名） ----
+function seqName() { return `${seq.major}_${seq.minor}`; }
+function clampSeq(v) {
+  const n = Math.floor(Number(v));
+  return Number.isFinite(n) && n >= 1 ? n : 1;   // 章・パートは 1 以上の整数
+}
+function saveSeq() { chrome.storage.local.set({ seq }); }
+function renderSeq() {
+  els.seqToggle.checked = seq.enabled;
+  els.seqPanel.hidden = !seq.enabled;
+  els.seqMajor.value = seq.major;
+  els.seqMinor.value = seq.minor;
+}
+function readSeqInputs() {
+  seq.major = clampSeq(els.seqMajor.value);
+  seq.minor = clampSeq(els.seqMinor.value);
+  saveSeq();
+  renderSeq();
+}
+// DL 開始時にパートを 1 つ進める（例: 1_1 → 1_2）
+function advanceSeq() {
+  seq.minor = clampSeq(seq.minor) + 1;
+  saveSeq();
+  renderSeq();
+}
+// DL 失敗時、楽観的に進めた番号をユーザーが触っていなければ巻き戻す
+function rollbackSeq(used) {
+  if (seq.major === used.major && seq.minor === used.minor + 1) {
+    seq.major = used.major;
+    seq.minor = used.minor;
+    saveSeq();
+    renderSeq();
+  }
 }
 
 // ---- helpers ----

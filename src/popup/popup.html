@@ -74,6 +74,20 @@
       <input type="checkbox" id="confirmName" />
       <span>保存前に名前を確認</span>
     </label>
+    <label class="opt-row" title="ON にすると、ダウンロードのたびに 章_パート の連番でファイル名を付けます">
+      <input type="checkbox" id="seqToggle" />
+      <span>連番で保存（章_パート）</span>
+    </label>
+    <div class="seq-panel" id="seqPanel" hidden>
+      <span class="seq-next">次の保存名</span>
+      <span class="seq-nums">
+        <input type="number" id="seqMajor" class="seq-input" min="1" inputmode="numeric" aria-label="章番号" />
+        <span class="seq-sep">_</span>
+        <input type="number" id="seqMinor" class="seq-input" min="1" inputmode="numeric" aria-label="パート番号" />
+      </span>
+      <button id="seqNextChapter" class="seq-btn" title="章を進める（章+1・パートを1に戻す）">次の章へ ▸</button>
+      <button id="seqReset" class="seq-icon-btn" title="1_1 に戻す" aria-label="リセット">⟲</button>
+    </div>
   </footer>
 
   <!-- アイテムのテンプレート -->
